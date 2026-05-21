@@ -14,12 +14,13 @@ if (!TOKEN || !DATABASE_ID) {
 const notion = new Client({ auth: TOKEN })
 const NOTE_DIR = path.join(__dirname, '../Article/note')
 
-// 辅助函数：简易解析 Frontmatter
+// 🎨 1. 健壮的 Markdown Frontmatter 解析器
 function parseMarkdown(filePath) {
   const content = fs.readFileSync(filePath, 'utf-8')
+  // 匹配开头的 --- frontmatter ---
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/)
   
-  let title = path.basename(filePath, '.md')
+  let title = path.basename(filePath, '.md').trim()
   let body = content
 
   if (match) {
@@ -30,126 +31,194 @@ function parseMarkdown(filePath) {
       title = titleMatch[1].trim()
     }
   }
-  return { title, body }
+  return { title, body: body.trim() }
 }
 
-// 简易将文本切分为 Notion 支持的 paragraph blocks（每一行一个 block）
-function convertToBlocks(text) {
+// 🎨 2. 核心：将 Markdown 文本流精准翻译为 Notion 官方支持的 Blocks 对象
+function markdownToNotionBlocks(text) {
+  if (!text) return []
   const lines = text.split(/\r?\n/)
   const blocks = []
+  
+  let inCodeBlock = false
+  let codeContent = []
+  let codeLanguage = 'javascript'
 
   for (let line of lines) {
-    if (!line.trim()) continue
-    
-    // 简易识别标题
+    const trimmed = line.trim()
+
+    // ─── 处理代码块 (Code Block) ───
+    if (trimmed.startsWith('```')) {
+      if (!inCodeBlock) {
+        inCodeBlock = true
+        codeLanguage = trimmed.replace('```', '').trim() || 'javascript'
+        codeContent = []
+      } else {
+        inCodeBlock = false
+        blocks.push({
+          object: 'block',
+          type: 'code',
+          code: {
+            language: codeLanguage,
+            rich_text: [{ type: 'text', text: { content: codeContent.join('\n') } }]
+          }
+        })
+      }
+      continue
+    }
+
+    if (inCodeBlock) {
+      codeContent.push(line)
+      continue
+    }
+
+    // ─── 处理一级标题 (# ) ───
     if (line.startsWith('# ')) {
       blocks.push({
         object: 'block',
         type: 'heading_1',
-        heading_1: { rich_text: [{ type: 'text', text: { content: line.replace('# ', '') } }] }
+        heading_1: { rich_text: [{ type: 'text', text: { content: line.substring(2) } }] }
       })
-    } else if (line.startsWith('## ')) {
+      continue
+    }
+
+    // ─── 处理二级标题 (## ) ───
+    if (line.startsWith('## ')) {
       blocks.push({
         object: 'block',
         type: 'heading_2',
-        heading_2: { rich_text: [{ type: 'text', text: { content: line.replace('## ', '') } }] }
+        heading_2: { rich_text: [{ type: 'text', text: { content: line.substring(3) } }] }
       })
-    } else {
-      // 普通文本
+      continue
+    }
+
+    // ─── 处理三级标题 (### ) ───
+    if (line.startsWith('### ')) {
       blocks.push({
         object: 'block',
-        type: 'paragraph',
-        paragraph: { rich_text: [{ type: 'text', text: { content: line } }] }
+        type: 'heading_3',
+        heading_3: { rich_text: [{ type: 'text', text: { content: line.substring(4) } }] }
       })
+      continue
     }
+
+    // ─── 处理无序列表 (* 或 -) ───
+    if (line.startsWith('* ') || line.startsWith('- ')) {
+      blocks.push({
+        object: 'block',
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: [{ type: 'text', text: { content: line.substring(2) } }] }
+      })
+      continue
+    }
+
+    // ─── 处理引用块 (> ) ───
+    if (line.startsWith('> ')) {
+      blocks.push({
+        object: 'block',
+        type: 'quote',
+        quote: { rich_text: [{ type: 'text', text: { content: line.substring(2) } }] }
+      })
+      continue
+    }
+
+    // ─── 普通段落 ───
+    blocks.push({
+      object: 'block',
+      type: 'paragraph',
+      paragraph: { rich_text: [{ type: 'text', text: { content: line || ' ' } }] }
+    })
   }
-  return blocks.slice(0, 99) // Notion 单次请求最多支持 100 个 blocks
+
+  return blocks.slice(0, 99) // Notion 限制单词追加上限为 100 个 block
 }
 
-// 查询 Notion 数据库中是否存在同名文章
+// 🎯 3. 寻找 Notion 对应页面
 async function findNotionPageByTitle(title) {
   const response = await notion.databases.query({
     database_id: DATABASE_ID.trim(),
     filter: {
-      property: 'Title', // 匹配你 Notion 中的 Title 列
-      title: {
-        equals: title
-      }
+      property: 'Title', // 匹配你截图确认的 Title 列
+      title: { equals: title }
     }
   })
   return response.results[0] || null
 }
 
-// 向 Notion 写入或更新文章
+// 🎯 4. 清理旧正文的辅助函数
+async function clearPageChildren(blockId) {
+  try {
+    const oldBlocks = await notion.blocks.children.list({ block_id: blockId })
+    for (const block of oldBlocks.results) {
+      await notion.blocks.delete({ block_id: block.id })
+    }
+  } catch (err) {
+    console.warn(`⚠️ 提示：清理旧 Blocks 时遇到障碍 (可能本就是空文章):`, err.message)
+  }
+}
+
+// 🎯 5. 执行单文件同步
 async function syncFileToNotion(filePath) {
   const { title, body } = parseMarkdown(filePath)
-  console.log(`📦 正在处理文章: ${title}...`)
+  console.log(`📦 准备同步文章: [${title}]`)
 
   try {
     const existingPage = await findNotionPageByTitle(title)
-    const blocks = convertToBlocks(body)
+    const blocks = markdownToNotionBlocks(body)
+
+    // 构建公共属性负载
+    const propertiesPayload = {
+      '展示': { checkbox: true },
+      '以此为最新基准': { checkbox: false }
+    }
 
     if (existingPage) {
-      console.log(`♻️  Notion 已存在该文章，执行覆盖更新...`)
+      console.log(`♻️  Notion 已存在 [${title}]，正在刷新正文块...`)
       
-      // 1. 清空旧的 Blocks (先获取旧的，再逐个删除)
-      const oldBlocks = await notion.blocks.children.list({ block_id: existingPage.id })
-      for (const block of oldBlocks.results) {
-        await notion.blocks.delete({ block_id: block.id })
-      }
-
-      // 2. 写入新的正文 Blocks
+      // 刷正文：先清空，再追加
+      await clearPageChildren(existingPage.id)
+      
       if (blocks.length > 0) {
-        await notion.blocks.children.append({
-          block_id: existingPage.id,
-          children: blocks
-        })
+        await notion.blocks.children.append({ block_id: existingPage.id, children: blocks })
       }
       
-      // 3. 更新属性
-      await notion.pages.update({
-        page_id: existingPage.id,
-        properties: {
-          '展示': { checkbox: true },
-          '以此为最新基准': { checkbox: false } // 更新完重置基准状态
-        }
-      })
+      // 刷属性
+      await notion.pages.update({ page_id: existingPage.id, properties: propertiesPayload })
       console.log(`✅ 文章更新成功: ${title}`)
     } else {
-      console.log(`✨ Notion 中未找到该文章，正在新建页面...`)
-      // 新建页面
+      console.log(`✨ Notion 中查无此文，正在为您创建新页面...`)
+      
+      // 动态注入主键标题列
+      propertiesPayload['Title'] = { title: [{ text: { content: title } }] }
+
       await notion.pages.create({
         parent: { database_id: DATABASE_ID.trim() },
-        properties: {
-          'Title': { title: [{ text: { content: title } }] },
-          '展示': { checkbox: true },
-          '以此为最新基准': { checkbox: false }
-        },
+        properties: propertiesPayload,
         children: blocks.length > 0 ? blocks : undefined
       })
       console.log(`✅ 新文章创建成功: ${title}`)
     }
   } catch (error) {
-    console.error(`❌ 同步文章 "${title}" 失败:`, error.message)
+    console.error(`❌ 同步文章 "${title}" 失败，详情:`, error.message)
   }
 }
 
 async function main() {
-  console.log('🚀 开始将 VS Code 笔记同步至 Notion...')
+  console.log('🚀 启动 [VS Code ➔ Notion] 反向高保真同步服务...')
   if (!fs.existsSync(NOTE_DIR)) {
-    console.error(`❌ 未找到笔记目录: ${NOTE_DIR}`)
+    console.error(`❌ 错误：未找到笔记存放目录: ${NOTE_DIR}`)
     return
   }
 
   const files = fs.readdirSync(NOTE_DIR).filter(file => file.endsWith('.md'))
-  console.log(`📚 发现本地共 ${files.length} 篇 Markdown 文档`)
+  console.log(`📚 本地共检索到 ${files.length} 篇 Markdown 文件待同步`)
 
   for (const file of files) {
     const fullPath = path.join(NOTE_DIR, file)
     await syncFileToNotion(fullPath)
   }
 
-  console.log('🎉 所有数据反向同步到 Notion 完成！')
+  console.log('🎉 恭喜，所有本地笔记已安全、完整地同步至 Notion！')
 }
 
 main()
