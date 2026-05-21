@@ -1,0 +1,35 @@
+name: Sync Blog to Notion
+
+on:
+  # 当你把代码 push 到 main 分支，且修改了 Article/note 目录下的 md 文件时触发
+  push:
+    branches:
+      - main
+    paths:
+      - 'Article/note/**.md'
+      - 'scripts/sync-notion.js'
+
+  # 允许手动在 GitHub 页面点击触发
+  workflow_dispatch:
+
+jobs:
+  sync-to-notion:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v3
+
+      - name: 设置 Node.js 环境
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: 安装项目依赖
+        run: npm install
+
+      - name: 运行反向同步脚本 (VS Code -> Notion)
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: node scripts/sync-notion.js

@@ -109,245 +109,200 @@
 
 #### 3.1 完善 sync-notion.yml 文件
 ```yml
-    name: Sync Notion to Blog
+    name: Sync Blog to Notion
 
     on:
-    # 每天凌晨 2 点自动执行
-    schedule:
-        - cron: '0 18 * * *'  # UTC 18:00 = 北京时间 02:00
-
-    # 手动触发
-    workflow_dispatch:
-
-    # 推送到 main 分支时触发（可选）
+    # 当你把代码 push 到 main 分支，且修改了 Article/note 目录下的 md 文件时触发
     push:
         branches:
         - main
         paths:
+        - 'Article/note/**.md'
         - 'scripts/sync-notion.js'
 
+    # 允许手动在 GitHub 页面点击触发
+    workflow_dispatch:
+
     jobs:
-    sync:
+    sync-to-notion:
         runs-on: ubuntu-latest
 
         steps:
         - name: Checkout 代码
             uses: actions/checkout@v3
 
-        - name: 设置 Node.js
+        - name: 设置 Node.js 环境
             uses: actions/setup-node@v3
             with:
             node-version: '18'
 
-        - name: 安装依赖
+        - name: 安装项目依赖
             run: npm install
 
-        - name: 同步 Notion 笔记
+        - name: 运行反向同步脚本 (VS Code -> Notion)
             env:
             NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
             NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
             run: node scripts/sync-notion.js
-
-        - name: 提交更改
-            run: |
-            git config --local user.email "github-actions[bot]@users.noreply.github.com"
-            git config --local user.name "github-actions[bot]"
-            # 💡 修改这里：把 md 文件和 images 文件夹下的所有变更都加进来
-            git add Article/note/*.md
-            git add Article/note/images/** 2>/dev/null || true
-            
-            git diff --quiet && git diff --staged --quiet || (git commit -m "🔄 自动同步 Notion 笔记及图片 $(date +'%Y-%m-%d %H:%M:%S')" && git push)
 ```
 
 #### 3.2 完善 sync-notion.js 文件
 ```js
     require('dotenv').config()
     const { Client } = require('@notionhq/client')
-    const { NotionToMarkdown } = require('notion-to-md')
     const fs = require('fs')
     const path = require('path')
-
-    // 仅用于 notion-to-md 解析正文内容
-    const notion = new Client({ auth: process.env.NOTION_TOKEN })
-    const n2m = new NotionToMarkdown({ notionClient: notion })
 
     const TOKEN = process.env.NOTION_TOKEN
     const DATABASE_ID = process.env.NOTION_DATABASE_ID
 
-    async function syncNotionToMarkdown() {
-    console.log('🚀 开始同步 Notion 笔记...')
-    
     if (!TOKEN || !DATABASE_ID) {
-        console.error('❌ 错误：未检测到环境变量，请检查 .env 文件是否放置在 NOTE 文件夹内！')
-        process.exit(1)
+    console.error('❌ 错误：未检测到环境变量，请检查 .env 文件！')
+    process.exit(1)
     }
 
-    // 清理可能带有换行或空格的 ID
-    const cleanDatabaseId = DATABASE_ID.trim()
+    const notion = new Client({ auth: TOKEN })
+    const NOTE_DIR = path.join(__dirname, '../Article/note')
+
+    // 辅助函数：简易解析 Frontmatter
+    function parseMarkdown(filePath) {
+    const content = fs.readFileSync(filePath, 'utf-8')
+    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/)
+    
+    let title = path.basename(filePath, '.md')
+    let body = content
+
+    if (match) {
+        const yaml = match[1]
+        body = match[2]
+        const titleMatch = yaml.match(/title:\s*(.*)/)
+        if (titleMatch && titleMatch[1]) {
+        title = titleMatch[1].trim()
+        }
+    }
+    return { title, body }
+    }
+
+    // 简易将文本切分为 Notion 支持的 paragraph blocks（每一行一个 block）
+    function convertToBlocks(text) {
+    const lines = text.split(/\r?\n/)
+    const blocks = []
+
+    for (let line of lines) {
+        if (!line.trim()) continue
+        
+        // 简易识别标题
+        if (line.startsWith('# ')) {
+        blocks.push({
+            object: 'block',
+            type: 'heading_1',
+            heading_1: { rich_text: [{ type: 'text', text: { content: line.replace('# ', '') } }] }
+        })
+        } else if (line.startsWith('## ')) {
+        blocks.push({
+            object: 'block',
+            type: 'heading_2',
+            heading_2: { rich_text: [{ type: 'text', text: { content: line.replace('## ', '') } }] }
+        })
+        } else {
+        // 普通文本
+        blocks.push({
+            object: 'block',
+            type: 'paragraph',
+            paragraph: { rich_text: [{ type: 'text', text: { content: line } }] }
+        })
+        }
+    }
+    return blocks.slice(0, 99) // Notion 单次请求最多支持 100 个 blocks
+    }
+
+    // 查询 Notion 数据库中是否存在同名文章
+    async function findNotionPageByTitle(title) {
+    const response = await notion.databases.query({
+        database_id: DATABASE_ID.trim(),
+        filter: {
+        property: 'Title', // 匹配你 Notion 中的 Title 列
+        title: {
+            equals: title
+        }
+        }
+    })
+    return response.results[0] || null
+    }
+
+    // 向 Notion 写入或更新文章
+    async function syncFileToNotion(filePath) {
+    const { title, body } = parseMarkdown(filePath)
+    console.log(`📦 正在处理文章: ${title}...`)
 
     try {
-        // 💡 彻底抛弃 SDK 拼接，直接用原生 fetch 精准请求 Notion 官方 API 终点
-        const url = `https://api.notion.com/v1/databases/${cleanDatabaseId}/query`
+        const existingPage = await findNotionPageByTitle(title)
+        const blocks = convertToBlocks(body)
+
+        if (existingPage) {
+        console.log(`♻️  Notion 已存在该文章，执行覆盖更新...`)
         
-        const res = await fetch(url, {
-            method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${TOKEN}`,
-            'Notion-Version': '2022-06-28',
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            filter: {
-                property: '展示',
-            checkbox: {
-                equals: true
+        // 1. 清空旧的 Blocks (先获取旧的，再逐个删除)
+        const oldBlocks = await notion.blocks.children.list({ block_id: existingPage.id })
+        for (const block of oldBlocks.results) {
+            await notion.blocks.delete({ block_id: block.id })
+        }
+
+        // 2. 写入新的正文 Blocks
+        if (blocks.length > 0) {
+            await notion.blocks.children.append({
+            block_id: existingPage.id,
+            children: blocks
+            })
+        }
+        
+        // 3. 更新属性
+        await notion.pages.update({
+            page_id: existingPage.id,
+            properties: {
+            '展示': { checkbox: true },
+            '以此为最新基准': { checkbox: false } // 更新完重置基准状态
             }
+        })
+        console.log(`✅ 文章更新成功: ${title}`)
+        } else {
+        console.log(`✨ Notion 中未找到该文章，正在新建页面...`)
+        // 新建页面
+        await notion.pages.create({
+            parent: { database_id: DATABASE_ID.trim() },
+            properties: {
+            'Title': { title: [{ text: { content: title } }] },
+            '展示': { checkbox: true },
+            '以此为最新基准': { checkbox: false }
             },
-            sorts: [
-                {
-                    property: '上次编辑时间', // 适配你的 Notion 列名
-                direction: 'descending'
-            }
-            ]
+            children: blocks.length > 0 ? blocks : undefined
         })
-        })
-
-        const response = await res.json()
-
-        // 捕捉可能存在的 API 鉴权等错误提示
-        if (!res.ok) {
-            throw new Error(response.message || '请求 Notion 失败')
+        console.log(`✅ 新文章创建成功: ${title}`)
         }
-
-        console.log(`📚 找到 ${response.results.length} 篇需要同步的文章`)
-
-        // 2. 遍历并下载每篇文章
-        for (const page of response.results) {
-            await syncPage(page)
-        }
-
-        console.log('✅ 同步完成！')
-    } catch (error) {
-        console.error('❌ 同步失败，错误详情:')
-        console.error(error.message)
-        process.exit(1)
-    }
-    }
-
-    // 在脚本顶部确保引入了 fs 和 path (你已经引入了)
-    // const fs = require('fs')
-    // const path = require('path')
-
-    async function syncPage(page) {
-        const pageId = page.id
-    const titleObj = page.properties['Title']?.title[0]?.plain_text?.trim()
-
-    if (!titleObj) {
-        console.log('⚠️  跳过：文章标题为空')
-        return
-    }
-
-    const title = titleObj
-    const createdTime = page.properties['创建时间']?.created_time || page.created_time
-    const updatedTime = page.properties['上次编辑时间']?.last_edited_time || page.last_edited_time
-
-    console.log(`📝 同步文章: ${title}`)
-
-    try {
-        const mdblocks = await n2m.pageToMarkdown(pageId)
-        let mdString = n2m.toMarkdownString(mdblocks).parent
-
-        // 📂 定义图片存储的本地目录（例如：Article/note/images/文章名/）
-        const cleanTitle = title.replace(/[\/\\:*?"<>|]/g, '-')
-        const outputDir = path.join(__dirname, '../Article/note')
-        const imagesDir = path.join(outputDir, 'images', cleanTitle)
-
-        // 正则表达式：匹配 Markdown 中的图片语法 ![alt](url)
-        const imgRegex = /!\[(.*?)\]\((.*?)\)/g
-        let match
-        const matches = []
-
-        // 先把所有图片链接捞出来
-        while ((match = imgRegex.exec(mdString)) !== null) {
-            matches.push({ alt: match[1], url: match[2] })
-        }
-
-        // 如果文章包含图片，且图片目录不存在，则创建
-        if (matches.length > 0 && !fs.existsSync(imagesDir)) {
-            fs.mkdirSync(imagesDir, { recursive: true })
-        }
-
-        // 循环下载图片并替换 Markdown 中的链接
-        for (let i = 0; i < matches.length; i++) {
-            const { alt, url } = matches[i]
-        
-        // 过滤掉已经是本地路径或外链（非 Notion 托管）的图片（可选）
-        if (url.startsWith('http')) {
-            console.log(`  ⏳ 正在下载第 ${i + 1} 张图片...`)
-            
-            // 生成本地文件名，比如 img_0.png, img_1.jpg
-            // 也可以从 url 中用正则提取原后缀，这里简单用临时后缀或探测
-            const ext = url.includes('.jpg') || url.includes('jpeg') ? 'jpg' : 'png'
-            const imgFileName = `img_${i}.${ext}`
-            const imgFilePath = path.join(imagesDir, imgFileName)
-
-            // 下载图片到本地
-            const success = await downloadImage(url, imgFilePath)
-
-            if (success) {
-                // 🔄 关键步骤：把绝对网络路径替换为博客系统认得的相对路径
-            // 这里的相对路径取决于你的博客框架（Hexo/Hugo/VitePress等）怎么读取静态资源
-            // 假设你的 Markdown 和 images 都在 note 目录下，相对路径就是 ./images/文章名/img_x.png
-            const relativePath = `./images/${cleanTitle}/${imgFileName}`
-            
-            // 全局替换该图片链接（注意转义处理防止正则冲突，这里精确替换字符串）
-            mdString = mdString.split(url).join(relativePath)
-            }
-        }
-        }
-
-        // 拼接 Frontmatter
-        const frontmatter = `---
-    title: ${title}
-    date: ${createdTime}
-    updated: ${updatedTime}
-    ---
-
-    `
-        const content = frontmatter + mdString
-        
-        if (!fs.existsSync(outputDir)) {
-            fs.mkdirSync(outputDir, { recursive: true })
-        }
-
-        const fileName = `${cleanTitle}.md`
-        const filePath = path.join(outputDir, fileName)
-
-        fs.writeFileSync(filePath, content, 'utf-8')
-        console.log(`✅ 已保存文章和图片: ${fileName}`)
     } catch (error) {
         console.error(`❌ 同步文章 "${title}" 失败:`, error.message)
     }
     }
 
-    // 🌐 辅助函数：利用 Node 18 自带的 fetch 下载图片流并写入本地
-    async function downloadImage(url, destPath) {
-        try {
-            const res = await fetch(url)
-        if (!res.ok) throw new Error(`请求失败: ${res.status}`)
-        
-        const arrayBuffer = await res.arrayBuffer()
-        const buffer = Buffer.from(arrayBuffer)
-        
-        fs.writeFileSync(destPath, buffer)
-        return true
-    } catch (err) {
-        console.error(`  ❌ 图片下载失败: ${err.message}`)
-        return false
-    }
+    async function main() {
+    console.log('🚀 开始将 VS Code 笔记同步至 Notion...')
+    if (!fs.existsSync(NOTE_DIR)) {
+        console.error(`❌ 未找到笔记目录: ${NOTE_DIR}`)
+        return
     }
 
-    syncNotionToMarkdown()
+    const files = fs.readdirSync(NOTE_DIR).filter(file => file.endsWith('.md'))
+    console.log(`📚 发现本地共 ${files.length} 篇 Markdown 文档`)
+
+    for (const file of files) {
+        const fullPath = path.join(NOTE_DIR, file)
+        await syncFileToNotion(fullPath)
+    }
+
+    console.log('🎉 所有数据反向同步到 Notion 完成！')
+    }
+
+    main()
 ```
 
 #### <span style="color:red">3.3 完善 .env 文件</span>
@@ -361,7 +316,6 @@
 ```
     这个也很重要 --  需要把 不想提交的文件保留在自己这里不提交到远程仓库
         .env
-        .github
         node_modules
         package-lock.json
 ```
