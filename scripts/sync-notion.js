@@ -3,7 +3,7 @@ const { Client } = require('@notionhq/client')
 const { NotionToMarkdown } = require('notion-to-md')
 const fs = require('fs')
 const path = require('path')
-const crypto = require('crypto') // 💡 引入加密模块用于计算 MD5
+const crypto = require('crypto') 
 
 // 仅用于 notion-to-md 解析正文内容
 const notion = new Client({ auth: process.env.NOTION_TOKEN })
@@ -86,37 +86,24 @@ async function syncPage(page) {
   const createdTime = page.properties['创建时间']?.created_time || page.created_time
   const updatedTime = page.properties['上次编辑时间']?.last_edited_time || page.last_edited_time
   
-  const isLatestBase = page.properties['以此为最新基准']?.checkbox || false
+  // 🎯 只要没勾选这个基准，直接跳过不处理，防止误覆盖本地手写稿
+  const isLatestBase = page.properties['以notion为最新基准']?.checkbox || false
+  if (!isLatestBase) {
+    console.log(`⏩ 跳过文章: ${title} [未勾选基准，不执行同步]`)
+    return
+  }
 
-  console.log(`📝 同步文章: ${title} [最新基准: ${isLatestBase ? '⭐ 是' : '  좀 否'}]`)
+  console.log(`📝 准备同步文章: ${title} [最新基准: ⭐ 是]`)
 
   try {
     const mdblocks = await n2m.pageToMarkdown(pageId)
     let mdString = n2m.toMarkdownString(mdblocks).parent
 
     // 📂 定义基础输出目录
-    let cleanTitle = title.replace(/[\/\\:*?"<>|]/g, '-')
+    const cleanTitle = title.replace(/[\/\\:*?"<>|]/g, '-')
     const outputDir = path.join(__dirname, '../Article/note')
-    
-    let fileName = `${cleanTitle}.md`
-    let filePath = path.join(outputDir, fileName)
-    
-    let shouldWrite = true
-    let isRename = false
-
-    // 🔒 状态判定：本地文件存在，且未勾选最新基准 -> 直接走重命名逻辑（不覆盖本地手写稿）
-    if (fs.existsSync(filePath) && !isLatestBase) {
-      const now = new Date()
-      const pad = (num) => String(num).padStart(2, '0')
-      const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`
-      
-      cleanTitle = `${cleanTitle}_${timestamp}`
-      fileName = `${cleanTitle}.md`
-      filePath = path.join(outputDir, fileName)
-      isRename = true
-      
-      console.log(`⚠️  检测到本地存在重名文件且未勾选基准，自动启用时间戳新文件名: ${fileName}`)
-    }
+    const fileName = `${cleanTitle}.md`
+    const filePath = path.join(outputDir, fileName)
 
     // 根据最终确定的 cleanTitle 创建独立的图片目录并下载图片
     const imagesDir = path.join(outputDir, 'images', cleanTitle)
@@ -158,27 +145,27 @@ updated: ${updatedTime}
 `
     const content = frontmatter + mdString
 
-    // 🎯 核心对比逻辑：如果刚才没有走重命名逻辑，且本地确实存在同名文件（即处于勾选了最新基准的覆盖场景）
-    if (!isRename && fs.existsSync(filePath)) {
+    // 🎯 纯粹的对比与替换逻辑
+    if (fs.existsSync(filePath)) {
       const localContent = fs.readFileSync(filePath, 'utf-8')
       
-      // 对比新旧内容的 MD5
       if (getMd5(content) === getMd5(localContent)) {
         console.log(`💤 内容无变化，跳过覆盖: ${fileName}`)
-        shouldWrite = false // 标记为不需要写入
+        return // 直接退出当前函数，不执行写入
       } else {
-        console.log(`♻️  检测到内容有变化，执行完全覆盖替换: ${fileName}`)
+        console.log(`♻️  检测到内容有变化，直接覆盖替换本地文档: ${fileName}`)
       }
+    } else {
+      console.log(`🆕 本地文件不存在，将创建新文档: ${fileName}`)
     }
 
     // 执行写入
-    if (shouldWrite) {
-      if (!fs.existsSync(outputDir)) {
-        fs.mkdirSync(outputDir, { recursive: true })
-      }
-      fs.writeFileSync(filePath, content, 'utf-8')
-      console.log(`✅ 已成功保存: ${fileName}`)
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true })
     }
+    fs.writeFileSync(filePath, content, 'utf-8')
+    console.log(`✅ 已成功保存: ${fileName}`)
+    
   } catch (error) {
     console.error(`❌ 同步文章 "${title}" 失败:`, error.message)
   }
