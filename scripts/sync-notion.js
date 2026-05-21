@@ -3,6 +3,7 @@ const { Client } = require('@notionhq/client')
 const { NotionToMarkdown } = require('notion-to-md')
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto') // 💡 引入加密模块用于计算 MD5
 
 // 仅用于 notion-to-md 解析正文内容
 const notion = new Client({ auth: process.env.NOTION_TOKEN })
@@ -10,6 +11,11 @@ const n2m = new NotionToMarkdown({ notionClient: notion })
 
 const TOKEN = process.env.NOTION_TOKEN
 const DATABASE_ID = process.env.NOTION_DATABASE_ID
+
+// 🌐 辅助函数：计算字符串的 MD5
+function getMd5(content) {
+  return crypto.createHash('md5').update(content, 'utf8').digest('hex')
+}
 
 async function syncNotionToMarkdown() {
   console.log('🚀 开始同步 Notion 笔记...')
@@ -19,11 +25,9 @@ async function syncNotionToMarkdown() {
     process.exit(1)
   }
 
-  // 清理可能带有换行或空格的 ID
   const cleanDatabaseId = DATABASE_ID.trim()
 
   try {
-    // 💡 彻底抛弃 SDK 拼接，直接用原生 fetch 精准请求 Notion 官方 API 终点
     const url = `https://api.notion.com/v1/databases/${cleanDatabaseId}/query`
     
     const res = await fetch(url, {
@@ -42,7 +46,7 @@ async function syncNotionToMarkdown() {
         },
         sorts: [
           {
-            property: '上次编辑时间', // 适配你的 Notion 列名
+            property: '上次编辑时间', 
             direction: 'descending'
           }
         ]
@@ -51,14 +55,12 @@ async function syncNotionToMarkdown() {
 
     const response = await res.json()
 
-    // 捕捉可能存在的 API 鉴权等错误提示
     if (!res.ok) {
       throw new Error(response.message || '请求 Notion 失败')
     }
 
     console.log(`📚 找到 ${response.results.length} 篇需要同步的文章`)
 
-    // 2. 遍历并下载每篇文章
     for (const page of response.results) {
       await syncPage(page)
     }
@@ -84,10 +86,9 @@ async function syncPage(page) {
   const createdTime = page.properties['创建时间']?.created_time || page.created_time
   const updatedTime = page.properties['上次编辑时间']?.last_edited_time || page.last_edited_time
   
-  // 🎯 获取 Notion 中的“以此为最新基准”状态 (Checkbox 默认值是布尔值)
   const isLatestBase = page.properties['以此为最新基准']?.checkbox || false
 
-  console.log(`📝 同步文章: ${title} [最新基准: ${isLatestBase ? '⭐ 是' : ' 좀 否'}]`)
+  console.log(`📝 同步文章: ${title} [最新基准: ${isLatestBase ? '⭐ 是' : '  좀 否'}]`)
 
   try {
     const mdblocks = await n2m.pageToMarkdown(pageId)
@@ -100,60 +101,48 @@ async function syncPage(page) {
     let fileName = `${cleanTitle}.md`
     let filePath = path.join(outputDir, fileName)
     
-    // 🔒 核心逻辑升级：当本地文件存在，且 Notion 端的【以此为最新基准】为 false 时，才追加时间戳
+    let shouldWrite = true
+    let isRename = false
+
+    // 🔒 状态判定：本地文件存在，且未勾选最新基准 -> 直接走重命名逻辑（不覆盖本地手写稿）
     if (fs.existsSync(filePath) && !isLatestBase) {
-      // 生成当前时间戳，格式如：20260521_1530
       const now = new Date()
       const pad = (num) => String(num).padStart(2, '0')
       const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`
       
-      // 更新标题和文件名，防止覆盖本地手写文档
       cleanTitle = `${cleanTitle}_${timestamp}`
       fileName = `${cleanTitle}.md`
       filePath = path.join(outputDir, fileName)
+      isRename = true
       
       console.log(`⚠️  检测到本地存在重名文件且未勾选基准，自动启用时间戳新文件名: ${fileName}`)
-    } else if (fs.existsSync(filePath) && isLatestBase) {
-      console.log(`♻️  检测到本地有同名文件，由于已勾选【最新基准】，执行完全覆盖替换: ${fileName}`)
     }
 
-    // 根据最终确定的 cleanTitle 创建独立的图片目录
+    // 根据最终确定的 cleanTitle 创建独立的图片目录并下载图片
     const imagesDir = path.join(outputDir, 'images', cleanTitle)
-
-    // 正则表达式：匹配 Markdown 中的图片语法 ![alt](url)
     const imgRegex = /!\[(.*?)\]\((.*?)\)/g
     let match
     const matches = []
 
-    // 先把所有图片链接捞出来
     while ((match = imgRegex.exec(mdString)) !== null) {
       matches.push({ alt: match[1], url: match[2] })
     }
 
-    // 如果文章包含图片，且图片目录不存在，则创建
     if (matches.length > 0 && !fs.existsSync(imagesDir)) {
       fs.mkdirSync(imagesDir, { recursive: true })
     }
 
-    // 循环下载图片并替换 Markdown 中的链接
     for (let i = 0; i < matches.length; i++) {
       const { alt, url } = matches[i]
-      
       if (url.startsWith('http')) {
         console.log(`  ⏳ 正在下载第 ${i + 1} 张图片...`)
-        
         const ext = url.includes('.jpg') || url.includes('jpeg') ? 'jpg' : 'png'
         const imgFileName = `img_${i}.${ext}`
         const imgFilePath = path.join(imagesDir, imgFileName)
 
-        // 下载图片到本地
         const success = await downloadImage(url, imgFilePath)
-
         if (success) {
-          // 🔄 使用最新确定的 cleanTitle 组合相对路径
           const relativePath = `./images/${cleanTitle}/${imgFileName}`
-          
-          // 全局替换该图片链接
           mdString = mdString.split(url).join(relativePath)
         }
       }
@@ -168,20 +157,33 @@ updated: ${updatedTime}
 
 `
     const content = frontmatter + mdString
-    
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir, { recursive: true })
+
+    // 🎯 核心对比逻辑：如果刚才没有走重命名逻辑，且本地确实存在同名文件（即处于勾选了最新基准的覆盖场景）
+    if (!isRename && fs.existsSync(filePath)) {
+      const localContent = fs.readFileSync(filePath, 'utf-8')
+      
+      // 对比新旧内容的 MD5
+      if (getMd5(content) === getMd5(localContent)) {
+        console.log(`💤 内容无变化，跳过覆盖: ${fileName}`)
+        shouldWrite = false // 标记为不需要写入
+      } else {
+        console.log(`♻️  检测到内容有变化，执行完全覆盖替换: ${fileName}`)
+      }
     }
 
-    // 写入最终的文件 (不论是覆盖原文件还是生成时间戳文件，都是通过这一步精确控制 filePath 写入)
-    fs.writeFileSync(filePath, content, 'utf-8')
-    console.log(`✅ 已成功保存: ${fileName}`)
+    // 执行写入
+    if (shouldWrite) {
+      if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true })
+      }
+      fs.writeFileSync(filePath, content, 'utf-8')
+      console.log(`✅ 已成功保存: ${fileName}`)
+    }
   } catch (error) {
     console.error(`❌ 同步文章 "${title}" 失败:`, error.message)
   }
 }
 
-// 🌐 辅助函数：利用 Node 18 自带的 fetch 下载图片流并写入本地
 async function downloadImage(url, destPath) {
   try {
     const res = await fetch(url)
