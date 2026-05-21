@@ -71,10 +71,12 @@ async function syncNotionToMarkdown() {
   }
 }
 
+// 在脚本顶部确保引入了 fs 和 path (你已经引入了)
+// const fs = require('fs')
+// const path = require('path')
+
 async function syncPage(page) {
   const pageId = page.id
-  
-  // 适配你的 Notion 列名 'Title'
   const titleObj = page.properties['Title']?.title[0]?.plain_text?.trim()
 
   if (!titleObj) {
@@ -90,8 +92,58 @@ async function syncPage(page) {
 
   try {
     const mdblocks = await n2m.pageToMarkdown(pageId)
-    const mdString = n2m.toMarkdownString(mdblocks)
+    let mdString = n2m.toMarkdownString(mdblocks).parent
 
+    // 📂 定义图片存储的本地目录（例如：Article/note/images/文章名/）
+    const cleanTitle = title.replace(/[\/\\:*?"<>|]/g, '-')
+    const outputDir = path.join(__dirname, '../Article/note')
+    const imagesDir = path.join(outputDir, 'images', cleanTitle)
+
+    // 正则表达式：匹配 Markdown 中的图片语法 ![alt](url)
+    const imgRegex = /!\[(.*?)\]\((.*?)\)/g
+    let match
+    const matches = []
+
+    // 先把所有图片链接捞出来
+    while ((match = imgRegex.exec(mdString)) !== null) {
+      matches.push({ alt: match[1], url: match[2] })
+    }
+
+    // 如果文章包含图片，且图片目录不存在，则创建
+    if (matches.length > 0 && !fs.existsSync(imagesDir)) {
+      fs.mkdirSync(imagesDir, { recursive: true })
+    }
+
+    // 循环下载图片并替换 Markdown 中的链接
+    for (let i = 0; i < matches.length; i++) {
+      const { alt, url } = matches[i]
+      
+      // 过滤掉已经是本地路径或外链（非 Notion 托管）的图片（可选）
+      if (url.startsWith('http')) {
+        console.log(`  ⏳ 正在下载第 ${i + 1} 张图片...`)
+        
+        // 生成本地文件名，比如 img_0.png, img_1.jpg
+        // 也可以从 url 中用正则提取原后缀，这里简单用临时后缀或探测
+        const ext = url.includes('.jpg') || url.includes('jpeg') ? 'jpg' : 'png'
+        const imgFileName = `img_${i}.${ext}`
+        const imgFilePath = path.join(imagesDir, imgFileName)
+
+        // 下载图片到本地
+        const success = await downloadImage(url, imgFilePath)
+
+        if (success) {
+          // 🔄 关键步骤：把绝对网络路径替换为博客系统认得的相对路径
+          // 这里的相对路径取决于你的博客框架（Hexo/Hugo/VitePress等）怎么读取静态资源
+          // 假设你的 Markdown 和 images 都在 note 目录下，相对路径就是 ./images/文章名/img_x.png
+          const relativePath = `./images/${cleanTitle}/${imgFileName}`
+          
+          // 全局替换该图片链接（注意转义处理防止正则冲突，这里精确替换字符串）
+          mdString = mdString.split(url).join(relativePath)
+        }
+      }
+    }
+
+    // 拼接 Frontmatter
     const frontmatter = `---
 title: ${title}
 date: ${createdTime}
@@ -99,20 +151,36 @@ updated: ${updatedTime}
 ---
 
 `
-    const content = frontmatter + mdString.parent
-    const outputDir = path.join(__dirname, '../Article/note')
+    const content = frontmatter + mdString
     
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true })
     }
 
-    const fileName = `${title.replace(/[\/\\:*?"<>|]/g, '-')}.md`
+    const fileName = `${cleanTitle}.md`
     const filePath = path.join(outputDir, fileName)
 
     fs.writeFileSync(filePath, content, 'utf-8')
-    console.log(`✅ 已保存: ${fileName}`)
+    console.log(`✅ 已保存文章和图片: ${fileName}`)
   } catch (error) {
     console.error(`❌ 同步文章 "${title}" 失败:`, error.message)
+  }
+}
+
+// 🌐 辅助函数：利用 Node 18 自带的 fetch 下载图片流并写入本地
+async function downloadImage(url, destPath) {
+  try {
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`请求失败: ${res.status}`)
+    
+    const arrayBuffer = await res.arrayBuffer()
+    const buffer = Buffer.from(arrayBuffer)
+    
+    fs.writeFileSync(destPath, buffer)
+    return true
+  } catch (err) {
+    console.error(`  ❌ 图片下载失败: ${err.message}`)
+    return false
   }
 }
 
