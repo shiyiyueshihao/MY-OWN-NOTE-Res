@@ -1,35 +1,48 @@
-name: Sync Blog to Notion
+name: Sync Notion to Blog
 
 on:
-  # 当你把代码 push 到 main 分支，且修改了 Article/note 目录下的 md 文件时触发
+  # 每天凌晨 2 点自动执行
+  schedule:
+    - cron: '0 18 * * *'  # UTC 18:00 = 北京时间 02:00
+
+  # 手动触发
+  workflow_dispatch:
+
+  # 推送到 main 分支时触发（可选）
   push:
     branches:
       - main
     paths:
-      - 'Article/note/**.md'
       - 'scripts/sync-notion.js'
 
-  # 允许手动在 GitHub 页面点击触发
-  workflow_dispatch:
-
 jobs:
-  sync-to-notion:
+  sync:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout 代码
         uses: actions/checkout@v3
 
-      - name: 设置 Node.js 环境
+      - name: 设置 Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '18'
 
-      - name: 安装项目依赖
+      - name: 安装依赖
         run: npm install
 
-      - name: 运行反向同步脚本 (VS Code -> Notion)
+      - name: 同步 Notion 笔记
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: node scripts/sync-notion.js
+
+      - name: 提交更改
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          # 💡 修改这里：把 md 文件和 images 文件夹下的所有变更都加进来
+          git add Article/note/*.md
+          git add Article/note/images/** 2>/dev/null || true
+          
+          git diff --quiet && git diff --staged --quiet || (git commit -m "🔄 自动同步 Notion 笔记及图片 $(date +'%Y-%m-%d %H:%M:%S')" && git push)
