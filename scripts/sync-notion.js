@@ -95,8 +95,28 @@ async function syncPage(page) {
     let mdString = n2m.toMarkdownString(mdblocks).parent
 
     // 📂 定义图片存储的本地目录（例如：Article/note/images/文章名/）
-    const cleanTitle = title.replace(/[\/\\:*?"<>|]/g, '-')
+    let cleanTitle = title.replace(/[\/\\:*?"<>|]/g, '-')
     const outputDir = path.join(__dirname, '../Article/note')
+    
+    // 🔒 核心改动：检测到本地 Markdown 重名时，自动为标题追加时间戳
+    let fileName = `${cleanTitle}.md`
+    let filePath = path.join(outputDir, fileName)
+    
+    if (fs.existsSync(filePath)) {
+      // 生成当前时间戳，格式如：20260521_1530
+      const now = new Date()
+      const pad = (num) => String(num).padStart(2, '0')
+      const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`
+      
+      // 更新标题和文件名，例如：Docker_Nginx_20260521_1530
+      cleanTitle = `${cleanTitle}_${timestamp}`
+      fileName = `${cleanTitle}.md`
+      filePath = path.join(outputDir, fileName)
+      
+      console.log(`⚠️  检测到本地存在重名文件，自动启用新文件名: ${fileName}`)
+    }
+
+    // 根据最终确定的 cleanTitle 创建独立的图片目录
     const imagesDir = path.join(outputDir, 'images', cleanTitle)
 
     // 正则表达式：匹配 Markdown 中的图片语法 ![alt](url)
@@ -118,12 +138,9 @@ async function syncPage(page) {
     for (let i = 0; i < matches.length; i++) {
       const { alt, url } = matches[i]
       
-      // 过滤掉已经是本地路径或外链（非 Notion 托管）的图片（可选）
       if (url.startsWith('http')) {
         console.log(`  ⏳ 正在下载第 ${i + 1} 张图片...`)
         
-        // 生成本地文件名，比如 img_0.png, img_1.jpg
-        // 也可以从 url 中用正则提取原后缀，这里简单用临时后缀或探测
         const ext = url.includes('.jpg') || url.includes('jpeg') ? 'jpg' : 'png'
         const imgFileName = `img_${i}.${ext}`
         const imgFilePath = path.join(imagesDir, imgFileName)
@@ -132,12 +149,8 @@ async function syncPage(page) {
         const success = await downloadImage(url, imgFilePath)
 
         if (success) {
-          // 🔄 关键步骤：把绝对网络路径替换为博客系统认得的相对路径
-          // 这里的相对路径取决于你的博客框架（Hexo/Hugo/VitePress等）怎么读取静态资源
-          // 假设你的 Markdown 和 images 都在 note 目录下，相对路径就是 ./images/文章名/img_x.png
+          // 🔄 使用带有时间戳的新的相对路径
           const relativePath = `./images/${cleanTitle}/${imgFileName}`
-          
-          // 全局替换该图片链接（注意转义处理防止正则冲突，这里精确替换字符串）
           mdString = mdString.split(url).join(relativePath)
         }
       }
@@ -157,11 +170,10 @@ updated: ${updatedTime}
       fs.mkdirSync(outputDir, { recursive: true })
     }
 
-    const fileName = `${cleanTitle}.md`
-    const filePath = path.join(outputDir, fileName)
-
+    // 写入最终的文件
     fs.writeFileSync(filePath, content, 'utf-8')
     console.log(`✅ 已保存文章和图片: ${fileName}`)
+
   } catch (error) {
     console.error(`❌ 同步文章 "${title}" 失败:`, error.message)
   }
